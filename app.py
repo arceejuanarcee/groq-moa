@@ -12,7 +12,7 @@ from moa.agent.prompts import SYSTEM_PROMPT, REFERENCE_SYSTEM_PROMPT
 
 # Default configuration
 default_main_agent_config = {
-    "main_model": "llama3-70b-8192",
+    "main_model": "llama-3.1-405b",
     "cycles": 3,
     "temperature": 0.1,
     "system_prompt": SYSTEM_PROMPT,
@@ -22,24 +22,24 @@ default_main_agent_config = {
 default_layer_agent_config = {
     "layer_agent_1": {
         "system_prompt": "Think through your response step by step. {helper_response}",
-        "model_name": "llama3-8b-8192",
+        "model_name": "llama-3.1-405b",
         "temperature": 0.3
     },
     "layer_agent_2": {
         "system_prompt": "Respond with a thought and then your response to the question. {helper_response}",
-        "model_name": "gemma-7b-it",
+        "model_name": "gemma2-9b-it",
         "temperature": 0.7
     },
     "layer_agent_3": {
         "system_prompt": "You are an expert at logic and reasoning. Always take a logical approach to the answer. {helper_response}",
-        "model_name": "llama3-8b-8192",
+        "model_name": "llama-3.1-70b-versatile",
         "temperature": 0.1
     },
 }
 
 # Recommended Configuration
 rec_main_agent_config = {
-    "main_model": "llama-3.1-70b-versatile",
+    "main_model": "llama-3.1-405b",
     "cycles": 2,
     "temperature": 0.1,
     "system_prompt": SYSTEM_PROMPT,
