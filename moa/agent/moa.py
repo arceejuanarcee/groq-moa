@@ -35,7 +35,8 @@ valid_model_names = Literal[
     'gemma2-9b-it',
     'mixtral-8x7b-32768',
     'llama-3.1-8b-instant',
-    'llama-3.1-70b-versatile'
+    'llama-3.1-70b-versatile',
+    'llama-3.1-405b'
 ]
 
 class ResponseChunk(TypedDict):
