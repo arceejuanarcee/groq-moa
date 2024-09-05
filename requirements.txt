@@ -8,3 +8,5 @@ openai
 anthropic
 tiktoken
 langchain-openai
+langchain-anthropic
+pydantic
