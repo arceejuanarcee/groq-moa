@@ -9,7 +9,7 @@ import re
 import traceback
 
 from groq import Groq
-from openai import OpenAI
+import OpenAI
 from anthropic import Anthropic
 
 from moa.agent import MOAgent
