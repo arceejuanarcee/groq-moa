@@ -1,92 +1,110 @@
+import os
+import logging
+from dotenv import load_dotenv
+import streamlit as st
 import copy
 import json
-from typing import Iterable, Dict, Any
+from typing import Iterable, Dict, Any, Generator
+import re
+import traceback
 
-import streamlit as st
-from streamlit_ace import st_ace
 from groq import Groq
+from openai import OpenAI
+from anthropic import Anthropic
 
-from moa.agent.moa import MOAgent
-from moa.agent.prompts import SYSTEM_PROMPT, REFERENCE_SYSTEM_PROMPT, ANALYZE_TRANSCRIPT_PROMPT, DEVELOP_CONTENT_STRATEGY_PROMPT, CONDUCT_RESEARCH_PROMPT, DEVELOP_STORY_STRATEGY_PROMPT, COMPOSE_CONTENT_PROMPT, REFINE_CONTENT_PROMPT
+from moa.agent import MOAgent
+from moa.agent.moa import ResponseChunk, MOAgentConfig
+from moa.agent.prompts import SYSTEM_PROMPT, REFERENCE_SYSTEM_PROMPT
 
-# Default configuration
-default_main_agent_config = {
-    "main_model": "llama3-70b-8192",
-    "cycles": 3,
-    "temperature": 0.1,
-    "system_prompt": SYSTEM_PROMPT,
-    "reference_system_prompt": REFERENCE_SYSTEM_PROMPT
-}
+import tiktoken
+from langchain.text_splitter import TokenTextSplitter
 
-default_layer_agent_config = {
-    "layer_agent_1": {
-        "system_prompt": ANALYZE_TRANSCRIPT_PROMPT,
-        "model_name": "llama3-8b-8192",
-        "temperature": 0.3
-    },
-    "layer_agent_2": {
-        "system_prompt": DEVELOP_CONTENT_STRATEGY_PROMPT,
-        "model_name": "gemma-7b-it",
-        "temperature": 0.7
-    },
-    "layer_agent_3": {
-        "system_prompt": CONDUCT_RESEARCH_PROMPT,
-        "model_name": "llama3-8b-8192",
-        "temperature": 0.1
-    },
-    "layer_agent_4": {
-        "system_prompt": DEVELOP_STORY_STRATEGY_PROMPT,
-        "model_name": "mixtral-8x7b-32768",
-        "temperature": 0.5
-    },
-    "layer_agent_5": {
-        "system_prompt": COMPOSE_CONTENT_PROMPT,
-        "model_name": "llama-3.1-70b-versatile",
-        "temperature": 0.4
-    },
-    "layer_agent_6": {
-        "system_prompt": REFINE_CONTENT_PROMPT,
-        "model_name": "llama-3.1-8b-instant",
-        "temperature": 0.2
-    },
-}
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Helper functions
-def json_to_moa_config(config_file) -> Dict[str, Any]:
-    config = json.load(config_file)
-    moa_config = MOAgentConfig( 
-        **config
-    ).model_dump(exclude_unset=True)
-    return {
-        'moa_layer_agent_config': moa_config.pop('layer_agent_config', None),
-        'moa_main_agent_config': moa_config or None
-    }
+# Load environment variables and set up API clients
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-def stream_response(messages: Iterable[Dict[str, Any]]):
-    layer_outputs = {}
-    for message in messages:
-        if message['response_type'] == 'intermediate':
-            layer = message['metadata']['layer']
-            if layer not in layer_outputs:
-                layer_outputs[layer] = []
-            layer_outputs[layer].append(message['delta'])
-        else:
-            for layer, outputs in layer_outputs.items():
-                st.write(f"Layer {layer}")
-                cols = st.columns(len(outputs))
-                for i, output in enumerate(outputs):
-                    with cols[i]:
-                        st.expander(label=f"Agent {i+1}", expanded=False).write(output)
-            layer_outputs = {}
-            yield message['delta']
+# Verify API keys
+if not all([GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY]):
+    logger.error("One or more API keys are missing. Please check your .env file.")
+    st.error("API keys are missing. Check the application logs for more information.")
+    st.stop()
+
+# Set up API clients
+groq_client = Groq(api_key=GROQ_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Available models (ensure these are correct and available)
+AVAILABLE_MODELS = [
+    'llama-3.1-70b-versatile',
+    'gemma2-9b-it',
+    'gpt-4',
+    'gpt-3.5-turbo',
+    'claude-3-sonnet-20240229'
+]
+
+def truncate_input(messages, max_tokens=4000):
+    tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
+    total_tokens = 0
+    truncated_messages = []
+
+    for message in reversed(messages):
+        message_tokens = len(tokenizer.encode(message['content']))
+        if total_tokens + message_tokens > max_tokens:
+            break
+        total_tokens += message_tokens
+        truncated_messages.insert(0, message)
+
+    return truncated_messages
+
+def configure_models():
+    st.sidebar.header("Model Configuration")
+    
+    # Choose number of layers
+    num_layers = st.sidebar.number_input("How many layers do you want?", min_value=1, max_value=5, value=3)
+    
+    # Configure main model
+    main_model = st.sidebar.selectbox("Select Main Model", options=AVAILABLE_MODELS, index=2)
+    main_temperature = st.sidebar.slider("Main Model Temperature", min_value=0.0, max_value=1.0, value=0.7, step=0.1)
+    
+    # Configure layer models
+    layer_agent_config = {}
+    for i in range(1, num_layers + 1):
+        st.sidebar.subheader(f"Layer {i} Configuration")
+        model = st.sidebar.selectbox(f"Model for Layer {i}", options=AVAILABLE_MODELS, key=f"layer_{i}_model")
+        temperature = st.sidebar.slider(f"Temperature for Layer {i}", min_value=0.0, max_value=1.0, value=0.7, step=0.1, key=f"layer_{i}_temp")
+        system_prompt = st.sidebar.text_area(f"System Prompt for Layer {i}", value=f"You are layer agent {i}. Analyze the input and provide your perspective. {{helper_response}}", key=f"layer_{i}_prompt")
+        
+        layer_agent_config[f"layer_agent_{i}"] = {
+            "system_prompt": system_prompt,
+            "model_name": model,
+            "temperature": temperature
+        }
+    
+    return main_model, main_temperature, layer_agent_config
 
 def set_moa_agent(
-    moa_main_agent_config = None,
-    moa_layer_agent_config = None,
-    override: bool = False
+    moa_main_agent_config=None,
+    moa_layer_agent_config=None,
+    override: bool = False,
+    transcript: str = "",
+    max_tokens: int = 4000,
+    overlap: int = 200
 ):
-    moa_main_agent_config = copy.deepcopy(moa_main_agent_config or default_main_agent_config)
-    moa_layer_agent_config = copy.deepcopy(moa_layer_agent_config or default_layer_agent_config)
+    moa_main_agent_config = copy.deepcopy(moa_main_agent_config or {})
+    moa_layer_agent_config = copy.deepcopy(moa_layer_agent_config or {})
+
+    # Include the transcript in the system prompt
+    if transcript:
+        temp_system_prompt = moa_main_agent_config.get("system_prompt", SYSTEM_PROMPT).replace("{transcript}", "{transcript}")
+        formatted_prompt = temp_system_prompt.format(transcript=transcript)
+        moa_main_agent_config["system_prompt"] = formatted_prompt
 
     if "moa_main_agent_config" not in st.session_state or override:
         st.session_state.moa_main_agent_config = moa_main_agent_config
@@ -97,209 +115,142 @@ def set_moa_agent(
     if override or ("moa_agent" not in st.session_state):
         st_main_copy = copy.deepcopy(st.session_state.moa_main_agent_config)
         st_layer_copy = copy.deepcopy(st.session_state.moa_layer_agent_config)
-        st.session_state.moa_agent = MOAgent.from_config(
-            **st_main_copy,
-            layer_agent_config=st_layer_copy
-        )
+        
+        # Ensure all required arguments are provided
+        config = {
+            "main_model": st_main_copy.get("main_model", "gpt-4"),
+            "cycles": st_main_copy.get("cycles", 3),
+            "temperature": st_main_copy.get("temperature", 0.7),
+            "system_prompt": st_main_copy.get("system_prompt", SYSTEM_PROMPT),
+            "reference_system_prompt": st_main_copy.get("reference_system_prompt", REFERENCE_SYSTEM_PROMPT),
+            "layer_agent_config": st_layer_copy,
+            "transcript": transcript,
+            "groq_api_key": GROQ_API_KEY,
+            "openai_api_key": OPENAI_API_KEY,
+            "anthropic_api_key": ANTHROPIC_API_KEY,
+            "max_tokens": max_tokens,
+            "overlap": overlap
+        }
+        
+        st.session_state.moa_agent = MOAgent.from_config(**config)
 
-        del st_main_copy
-        del st_layer_copy
+def format_response(response):
+    if isinstance(response, dict):
+        if 'formatted_response' in response:
+            content = response['formatted_response']
+        elif 'responses' in response and response['responses']:
+            content = response['responses'][0]
+        else:
+            return "I'm sorry, I couldn't generate a proper response."
+    elif isinstance(response, str):
+        content = response
+    else:
+        return "I'm sorry, I couldn't generate a proper response."
 
-    del moa_main_agent_config
-    del moa_layer_agent_config
-
-# App
-st.set_page_config(
-    page_title="LinkedIn Content Creation Powered by Groq",
-    page_icon='static/favicon.ico',
-    menu_items={
-        'About': "## Groq Mixture-Of-Agents for LinkedIn Content Creation"
-    },
-    layout="wide"
-)
-
-valid_model_names = [model.id for model in Groq().models.list().data if not (model.id.startswith("whisper") or model.id.startswith("llama-guard"))]
-
-st.markdown("<a href='https://groq.com'><img src='app/static/banner.png' width='500'></a>", unsafe_allow_html=True)
-st.write("---")
-
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-set_moa_agent()
-
-# Sidebar for configuration
-with st.sidebar:
-    st.title("LinkedIn Content Configuration")
-    st.download_button(
-        "Download Current MoA Configuration as JSON", 
-        data=json.dumps({
-            **st.session_state.moa_main_agent_config,
-            'moa_layer_agent_config': st.session_state.moa_layer_agent_config
-        }, indent=2),
-        file_name="moa_config.json"
-    )
-
-    with st.form("Agent Configuration", border=False):    
-        if st.form_submit_button("Use Recommended Config"):
-            try:
-                set_moa_agent(
-                    moa_main_agent_config=rec_main_agent_config,
-                    moa_layer_agent_config=rec_layer_agent_config,
-                    override=True
-                )
-                st.session_state.messages = []
-                st.success("Configuration updated successfully!")
-            except json.JSONDecodeError:
-                st.error("Invalid JSON in Layer Agent Configuration. Please check your input.")
-            except Exception as e:
-                st.error(f"Error updating configuration: {str(e)}")
-
-        # Main model selection
-        new_main_model = st.selectbox(
-            "Select Main Model",
-            options=valid_model_names,
-            index=valid_model_names.index(st.session_state.moa_main_agent_config['main_model'])
-        )
-
-        # Cycles input
-        new_cycles = st.number_input(
-            "Number of Layers",
-            min_value=1,
-            max_value=10,
-            value=st.session_state.moa_main_agent_config['cycles']
-        )
-
-        # Main Model Temperature
-        main_temperature = st.number_input(
-            label="Main Model Temperature",
-            value=0.1,
-            min_value=0.0,
-            max_value=1.0,
-            step=0.1
-        )
-
-        # Layer agent configuration
-        tooltip = "Agents in the layer agent configuration run in parallel per cycle. Each layer agent supports all initialization parameters of Langchain's ChatGroq class as valid dictionary fields."
-        st.markdown("Layer Agent Config", help=tooltip)
-        new_layer_agent_config = st_ace(
-            key="layer_agent_config",
-            value=json.dumps(st.session_state.moa_layer_agent_config, indent=2),
-            language='json',
-            placeholder="Layer Agent Configuration (JSON)",
-            show_gutter=False,
-            wrap=True,
-            auto_update=True
-        )
-
-        with st.expander("Optional Main Agent Params"):
-            tooltip_str = """\
-Main Agent configuration that will respond to the user based on the layer agent outputs.
-Valid fields:
-- ``system_prompt``: System prompt given to the main agent. \
-**IMPORTANT**: it should always include a `{helper_response}` prompt variable.
-- ``reference_prompt``: This prompt is used to concatenate and format each layer agent's output into one string. \
-This is passed into the `{helper_response}` variable in the system prompt. \
-**IMPORTANT**: it should always include a `{responses}` prompt variable. 
-- ``main_model``: Which Groq powered model to use. Will overwrite the model given in the dropdown.\
-"""
-            tooltip = tooltip_str
-            st.markdown("Main Agent Config", help=tooltip)
-            new_main_agent_config = st_ace(
-                key="main_agent_params",
-                value=json.dumps(st.session_state.moa_main_agent_config, indent=2),
-                language='json',
-                placeholder="Main Agent Configuration (JSON)",
-                show_gutter=False,
-                wrap=True,
-                auto_update=True
-            )
-
-        if st.form_submit_button("Update Configuration"):
-            try:
-                new_layer_config = json.loads(new_layer_agent_config)
-                new_main_config = json.loads(new_main_agent_config)
-                if new_main_config.get('main_model', default_main_agent_config['main_model']) == default_main_agent_config["main_model"]:
-                    new_main_config['main_model'] = new_main_model
-                
-                if new_main_config.get('cycles', default_main_agent_config['cycles']) == default_main_agent_config["cycles"]:
-                    new_main_config['cycles'] = new_cycles
-
-                if new_main_config.get('temperature', default_main_agent_config['temperature']) == default_main_agent_config["temperature"]:
-                    new_main_config['temperature'] = main_temperature
-                
-                set_moa_agent(
-                    moa_main_agent_config=new_main_config,
-                    moa_layer_agent_config=new_layer_config,
-                    override=True
-                )
-                st.session_state.messages = []
-                st.success("Configuration updated successfully!")
-            except json.JSONDecodeError:
-                st.error("Invalid JSON in Layer Agent Configuration. Please check your input.")
-            except Exception as e:
-                st.error(f"Error updating configuration: {str(e)}")
-
-    st.markdown("---")
-    st.markdown("""
-    ### Credits
-    - MOA: [Together AI](https://www.together.ai/blog/together-moa)
-    - LLMs: [Groq](https://groq.com/)
-    """)
-
-# Main app layout
-st.header("LinkedIn Content Creation", anchor=False)
-st.write("A demo of the Mixture of Agents architecture adapted for LinkedIn content creation.")
-
-# Display current configuration
-with st.status("Current MOA Configuration", expanded=True, state='complete') as config_status:
-    st.image("./static/moa_groq.svg", caption="Mixture of Agents Workflow", use_column_width='always')
-    st.markdown(f"**Main Agent Config**:")
-    new_layer_agent_config = st_ace(
-        value=json.dumps(st.session_state.moa_main_agent_config, indent=2),
-        language='json',
-        placeholder="Layer Agent Configuration (JSON)",
-        show_gutter=False,
-        wrap=True,
-        readonly=True,
-        auto_update=True
-    )
-    st.markdown(f"**Layer Agents Config**:")
-    new_layer_agent_config = st_ace(
-        value=json.dumps(st.session_state.moa_layer_agent_config, indent=2),
-        language='json',
-        placeholder="Layer Agent Configuration (JSON)",
-        show_gutter=False,
-        wrap=True,
-        readonly=True,
-        auto_update=True
-    )
-
-if st.session_state.get("message", []) != []:
-    st.session_state['expand_config'] = False
-# Chat interface
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if query := st.chat_input("Ask a question"):
-    config_status.update(expanded=False)
-    st.session_state.messages.append({"role": "user", "content": query})
-    with st.chat_message("user"):
-        st.write(query)
-
-    moa_agent: MOAgent = st.session_state.moa_agent
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        transcript = "Your input transcript here"
-        brief = "Your brief here"
-        content_strategy = "Your content strategy here"
-        research_report = "Your research report here"
-        story_strategy = "Your story strategy here"
-        composed_content = "Your composed content here"
-        output = "Your output here"
-        ast_mess = stream_response(moa_agent.chat(query, transcript, brief, content_strategy, research_report, story_strategy, composed_content, output, output_format='json'))
-        response = st.write_stream(ast_mess)
+    # Remove system instructions and any text before the actual content
+    content = re.split(r'LinkedIn Post:|Use the following responses from other models to craft your final answer:', content)[-1].strip()
     
-    st.session_state.messages.append({"role": "assistant", "content": response})
+    # Remove numbered list at the beginning
+    content = re.sub(r'^\d+\.\s+', '', content, flags=re.MULTILINE)
+    
+    # Replace \n with actual line breaks
+    content = content.replace('\\n', '\n')
+    
+    # Remove extra newlines
+    content = re.sub(r'\n{3,}', '\n\n', content)
+    
+    # Remove hashtags and any text after them
+    content = re.sub(r'\s*#\w+.*$', '', content, flags=re.MULTILINE)
+    
+    # Remove any remaining system instructions or formatting artifacts
+    content = re.sub(r'Ensure your response is.*$', '', content, flags=re.DOTALL)
+    
+    return content.strip()
+
+def chat_with_truncated_input(agent, input_text):
+    try:
+        truncated_messages = truncate_input(st.session_state.messages)
+        response = ""
+        for chunk in agent.chat(input_text, messages=truncated_messages):
+            if isinstance(chunk, dict) and 'response_type' in chunk:
+                if chunk['response_type'] == "error":
+                    logger.error(f"Error in agent response: {chunk['delta']}")
+                    st.error(chunk['delta'])
+                elif chunk['response_type'] == "intermediate":
+                    logger.info(f"Layer {chunk['metadata']['layer']}: {chunk['delta']}")
+                    st.info(f"Layer {chunk['metadata']['layer']}: {chunk['delta']}")
+                else:
+                    response += chunk['delta']
+            else:
+                response += chunk
+        return response
+    except Exception as e:
+        logger.error(f"Error in chat_with_truncated_input: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+def main():
+    st.title("Multi-Model Mixture of Agents")
+
+    try:
+        # Initialize the MOAgent with default values
+        set_moa_agent()
+
+        # Configure models
+        main_model, main_temperature, layer_agent_config = configure_models()
+
+        # Update MOAgent configuration
+        if st.sidebar.button("Update Configuration"):
+            main_agent_config = {
+                "main_model": main_model,
+                "cycles": len(layer_agent_config),
+                "temperature": main_temperature,
+                "system_prompt": SYSTEM_PROMPT,
+                "reference_system_prompt": REFERENCE_SYSTEM_PROMPT
+            }
+            set_moa_agent(
+                moa_main_agent_config=main_agent_config,
+                moa_layer_agent_config=layer_agent_config,
+                override=True,
+                max_tokens=3000,
+                overlap=100
+            )
+            st.sidebar.success("Configuration updated successfully!")
+
+        # Initialize chat history
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+
+        # Display chat messages
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        # User input
+        if prompt := st.chat_input("Type in your request"):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant"):
+                try:
+                    response = chat_with_truncated_input(st.session_state.moa_agent, prompt)
+                    formatted_response = format_response(response)
+                    if not formatted_response or formatted_response == "I'm sorry, I couldn't generate a proper response.":
+                        logger.warning("AI agent failed to generate a proper response.")
+                        st.error("I apologize, but I couldn't generate a proper response. Could you please try rephrasing your question?")
+                    else:
+                        st.markdown(formatted_response)
+                        st.session_state.messages.append({"role": "assistant", "content": formatted_response})
+                except Exception as e:
+                    logger.error(f"An error occurred in main: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    st.error("I encountered an error while processing your request. Please try again or rephrase your question.")
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in main: {str(e)}")
+        logger.error(traceback.format_exc())
+        st.error("An unexpected error occurred. Please check the logs for more details.")
+
+if __name__ == "__main__":
+    main()
